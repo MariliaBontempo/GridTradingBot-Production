@@ -76,6 +76,9 @@ contract GridTradingBot is IGridTradingBot, IAutomationCompatibleInterface, Reen
     /// @notice Default TWAP interval in seconds
     uint32 public constant DEFAULT_TWAP_INTERVAL = 60;
 
+    /// @notice Maximum swaps per execution to prevent gas limit issues
+    uint256 public constant MAX_SWAPS_PER_EXECUTION = 10;
+
     // ============ Immutables ============
 
     /// @notice Uniswap V3 SwapRouter address
@@ -335,8 +338,11 @@ contract GridTradingBot is IGridTradingBot, IAutomationCompatibleInterface, Reen
         uint256 currentPrice = _getTWAPPrice();
         require(currentPrice > 0, "Could not get price");
 
+        // Track swaps executed to prevent gas limit issues
+        uint256 swapsExecuted = 0;
+
         // Loop through all levels and check for triggers
-        for (uint256 i = 0; i < _levelCount; i++) {
+        for (uint256 i = 0; i < _levelCount && swapsExecuted < MAX_SWAPS_PER_EXECUTION; i++) {
             GridLevel storage level = _gridLevels[i];
 
             // Skip inactive levels or levels in cooldown
@@ -357,6 +363,7 @@ contract GridTradingBot is IGridTradingBot, IAutomationCompatibleInterface, Reen
 
             if (shouldExecute) {
                 _executeSwap(i, level.isBuyLevel, currentPrice);
+                swapsExecuted++;
             }
         }
     }
@@ -423,8 +430,10 @@ contract GridTradingBot is IGridTradingBot, IAutomationCompatibleInterface, Reen
         // Calculate minimum output with slippage protection
         minAmountOut = (expectedAmountOut * (BPS_DENOMINATOR - _gridConfig.maxSlippageBps)) / BPS_DENOMINATOR;
 
-        // Approve SwapRouter to spend tokens
-        IERC20(tokenIn).safeIncreaseAllowance(swapRouter, amountIn);
+        // Reset allowance to zero first, then set exact amount needed
+        // This prevents unbounded allowance growth over time
+        IERC20(tokenIn).safeApprove(swapRouter, 0);
+        IERC20(tokenIn).safeApprove(swapRouter, amountIn);
 
         // Build swap parameters
         ISwapRouterMinimal.ExactInputSingleParams memory params = ISwapRouterMinimal.ExactInputSingleParams({
@@ -442,9 +451,11 @@ contract GridTradingBot is IGridTradingBot, IAutomationCompatibleInterface, Reen
         uint256 amountOut;
         try ISwapRouterMinimal(swapRouter).exactInputSingle(params) returns (uint256 _amountOut) {
             amountOut = _amountOut;
+            // Reset allowance to zero after successful swap
+            IERC20(tokenIn).safeApprove(swapRouter, 0);
         } catch {
-            // Swap failed - reset allowance and skip
-            IERC20(tokenIn).safeDecreaseAllowance(swapRouter, amountIn);
+            // Swap failed - reset allowance to zero
+            IERC20(tokenIn).safeApprove(swapRouter, 0);
             return;
         }
 
